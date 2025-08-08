@@ -25,7 +25,6 @@ from litellm.types.utils import ModelResponse
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 
-
 class PanwPrismaAirsHandler(CustomGuardrail):
     """
     LiteLLM Built-in Guardrail for Palo Alto Networks Prisma AI Runtime Security (AIRS).
@@ -230,6 +229,24 @@ class PanwPrismaAirsHandler(CustomGuardrail):
 
         return error_detail
 
+    def _check_scan_result(
+        self, scan_result: Dict[str, Any], is_response: bool = False
+    ) -> None:
+        """Check scan result and raise HTTPException if content should be blocked."""
+        action = scan_result.get("action", "block")
+        category = scan_result.get("category", "unknown")
+
+        if action == "allow":
+            verbose_proxy_logger.info(
+                f"PANW Prisma AIRS: {'Response' if is_response else 'Prompt'} allowed (Category: {category})"
+            )
+        else:
+            error_detail = self._build_error_detail(scan_result, is_response=is_response)
+            verbose_proxy_logger.warning(
+                f"PANW Prisma AIRS: {error_detail['error']['message']}"
+            )
+            raise HTTPException(status_code=400, detail=error_detail)
+
     @log_guardrail_information
     async def async_pre_call_hook(
         self,
@@ -275,20 +292,8 @@ class PanwPrismaAirsHandler(CustomGuardrail):
             content=prompt_text, is_response=False, metadata=metadata
         )
 
-        action = scan_result.get("action", "block")
-        category = scan_result.get("category", "unknown")
-
-        if action == "allow":
-            verbose_proxy_logger.info(
-                f"PANW Prisma AIRS: Response allowed (Category: {category})"
-            )
-
-        else:
-            error_detail = self._build_error_detail(scan_result, is_response=True)
-            verbose_proxy_logger.warning(
-                f"PANW Prisma AIRS: {error_detail['error']['message']}"
-            )
-            raise HTTPException(status_code=400, detail=error_detail)
+        # Check scan result and raise exception if needed
+        self._check_scan_result(scan_result, is_response=False)
 
         return None
 
@@ -326,20 +331,8 @@ class PanwPrismaAirsHandler(CustomGuardrail):
             content=response_text, is_response=True, metadata=metadata
         )
 
-        action = scan_result.get("action", "block")
-        category = scan_result.get("category", "unknown")
-
-        if action == "allow":
-            verbose_proxy_logger.info(
-                f"PANW Prisma AIRS: Response allowed (Category: {category})"
-            )
-
-        else:
-            error_detail = self._build_error_detail(scan_result, is_response=True)
-            verbose_proxy_logger.warning(
-                f"PANW Prisma AIRS: {error_detail['error']['message']}"
-            )
-            raise HTTPException(status_code=400, detail=error_detail)
+        # Check scan result and raise exception if needed
+        self._check_scan_result(scan_result, is_response=True)
 
         return response
 
