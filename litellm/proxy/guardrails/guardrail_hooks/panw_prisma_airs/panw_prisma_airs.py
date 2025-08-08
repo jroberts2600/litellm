@@ -6,7 +6,7 @@ PANW Prisma AIRS Built-in Guardrail for LiteLLM
 
 import os
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Literal, Optional, Type, Union, cast
 
 from fastapi import HTTPException
 
@@ -24,6 +24,7 @@ from litellm.types.utils import ModelResponse
 
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
+    from litellm.types.utils import ModelResponseStream
 
 class PanwPrismaAirsHandler(CustomGuardrail):
     """
@@ -37,6 +38,8 @@ class PanwPrismaAirsHandler(CustomGuardrail):
         api_key: PANW Prisma AIRS API key
         api_base: PANW Prisma AIRS API endpoint
         profile_name: PANW Prisma AIRS security profile name
+        incremental_scan_chunk_size: Size of text chunks to scan incrementally (0 for full response scan, default 0)
+        disable_streaming_check: If True, disables streaming checks and passes through all chunks, only run post_call_success_hook. defaults to False
         default_on: Whether to enable by default
     """
 
@@ -46,7 +49,9 @@ class PanwPrismaAirsHandler(CustomGuardrail):
         api_key: str,
         api_base: str,
         profile_name: str,
+        incremental_scan_chunk_size: int = 0,
         default_on: bool = True,
+        disable_streaming_check: bool = False,
         **kwargs,
     ):
         """Initialize PANW Prisma AIRS guardrail handler."""
@@ -62,9 +67,11 @@ class PanwPrismaAirsHandler(CustomGuardrail):
             or "https://service.api.aisecurity.paloaltonetworks.com"
         )
         self.profile_name = profile_name
+        self.incremental_scan_chunk_size = incremental_scan_chunk_size
+        self.disable_streaming_check = disable_streaming_check  
 
         verbose_proxy_logger.info(
-            f"Initialized PANW Prisma AIRS Guardrail: {guardrail_name}"
+            f"Initialized PANW Prisma AIRS Guardrail: {guardrail_name}, incremental_scan_chunk_size: {incremental_scan_chunk_size}, disable_streaming_check: {disable_streaming_check}"
         )
 
     def _extract_text_from_messages(self, messages: List[Dict[str, Any]]) -> str:
@@ -118,6 +125,17 @@ class PanwPrismaAirsHandler(CustomGuardrail):
             verbose_proxy_logger.error(
                 "PANW Prisma AIRS: Error extracting response text"
             )
+        return ""
+
+    def _extract_text_from_chunk(self, chunk: "ModelResponseStream") -> str:
+        """Extract text content from a streaming chunk."""
+        try:
+            if hasattr(chunk, "choices") and chunk.choices and len(chunk.choices) > 0:
+                choice = chunk.choices[0]
+                if hasattr(choice, "delta") and hasattr(choice.delta, "content"):
+                    return choice.delta.content or ""
+        except (AttributeError, IndexError):
+            verbose_proxy_logger.debug("PANW Prisma AIRS: No content in chunk")
         return ""
 
     async def _call_panw_api(
@@ -247,6 +265,25 @@ class PanwPrismaAirsHandler(CustomGuardrail):
             )
             raise HTTPException(status_code=400, detail=error_detail)
 
+    def _create_error_chunk(self, assembled_model_response: ModelResponse, error_detail: Dict[str, Any]) -> "ModelResponseStream":
+        """Create an error chunk to terminate the stream."""
+        from litellm.types.utils import ModelResponseStream, StreamingChoices, Delta
+        
+        return ModelResponseStream(
+            id=assembled_model_response.id if hasattr(assembled_model_response, 'id') else 'chatcmpl-error',
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        content=f"\n\n[BLOCKED BY PANW PRISMA AIRS]: Error: 400 {error_detail}"
+                    ),
+                    finish_reason="stop"
+                )
+            ],
+            model=assembled_model_response.model if hasattr(assembled_model_response, 'model') else 'unknown',
+            object="chat.completion.chunk"
+        )
+
     @log_guardrail_information
     async def async_pre_call_hook(
         self,
@@ -335,6 +372,259 @@ class PanwPrismaAirsHandler(CustomGuardrail):
         self._check_scan_result(scan_result, is_response=True)
 
         return response
+
+    @log_guardrail_information
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: Any,
+        request_data: Dict[str, Any],
+    ) -> AsyncGenerator["ModelResponseStream", None]:
+        """
+        Process streaming response chunks for PANW Prisma AIRS scanning.
+
+        Supports both incremental scanning (configurable interval) and complete response scanning.
+        If incremental_scan_chunk_size > 0, checks content at regular intervals and only yields chunks after verification.
+        If incremental_scan_chunk_size = 0, only checks the complete response at the end.
+        If disable_streaming_check is True, passes through all chunks without any scanning.
+        """
+        # Import here to avoid circular imports
+        from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
+        from litellm.main import stream_chunk_builder
+        from litellm.types.utils import TextCompletionResponse
+
+        # Check if streaming check is disabled, if so, pass through all chunks directly
+        if getattr(self, 'disable_streaming_check', False):
+            verbose_proxy_logger.info("PANW Prisma AIRS: Streaming check disabled, passing through all chunks")
+            async for chunk in response:
+                yield chunk
+            return
+
+        verbose_proxy_logger.info(
+            f"PANW Prisma AIRS: Running streaming response scan with incremental_scan_chunk_size={self.incremental_scan_chunk_size}"
+        )
+
+        # Prepare metadata
+        metadata = {
+            "user": request_data.get("user", "litellm_user"),
+            "model": request_data.get("model", "unknown"),
+        }
+
+        # If incremental checking is disabled (interval = 0), collect all chunks first
+        if self.incremental_scan_chunk_size == 0:
+            verbose_proxy_logger.info("PANW Prisma AIRS: Incremental checking disabled, collecting all chunks for final scan")
+            
+            # Collect all chunks to process them together
+            all_chunks: List["ModelResponseStream"] = []
+            try:
+                async for chunk in response:
+                    all_chunks.append(chunk)
+                    # Do not yield chunks immediately, wait for check results
+            except Exception as e:
+                # If there's an error collecting chunks, just pass through
+                verbose_proxy_logger.error(f"PANW Prisma AIRS: Error collecting chunks: {str(e)}")
+                return
+
+            # Assemble the complete response from chunks for final scanning
+            assembled_model_response: Optional[
+                Union[ModelResponse, TextCompletionResponse]
+            ] = stream_chunk_builder(
+                chunks=all_chunks,
+            )
+
+            if isinstance(assembled_model_response, (type(None), TextCompletionResponse)):
+                # If we can't assemble a ModelResponse or it's a text completion, 
+                # yield all chunks (fail open approach)
+                verbose_proxy_logger.warning(
+                    "PANW Prisma AIRS: Could not assemble ModelResponse from chunks, yielding all chunks"
+                )
+                for chunk in all_chunks:
+                    yield chunk
+                return
+
+            # Extract response text for final scanning
+            response_text = self._extract_response_text(assembled_model_response)
+            if response_text:
+                verbose_proxy_logger.info(
+                    f"PANW Prisma AIRS: Performing final scan on complete response ({len(response_text)} characters)"
+                )
+                
+                try:
+                    # Scan response with PANW Prisma AIRS
+                    scan_result = await self._call_panw_api(
+                        content=response_text, is_response=True, metadata=metadata
+                    )
+                    
+                    action = scan_result.get("action", "block")
+                    category = scan_result.get("category", "unknown")
+
+                    if action != "allow":
+                        # Content is blocked - don't yield the chunks, return error instead
+                        error_detail = self._build_error_detail(scan_result, is_response=True)
+                        verbose_proxy_logger.warning(
+                            f"PANW Prisma AIRS: Final scan blocked complete response - {error_detail['error']['message']}"
+                        )
+                        # Create and yield error chunk instead of original content
+                        error_chunk = self._create_error_chunk(assembled_model_response, error_detail)
+                        yield error_chunk
+                        return
+                    else:
+                        verbose_proxy_logger.info(
+                            f"PANW Prisma AIRS: Final scan passed for complete response (Category: {category})"
+                        )
+                        # Content is safe - yield all chunks
+                        for chunk in all_chunks:
+                            yield chunk
+                        return
+                        
+                except Exception as e:
+                    verbose_proxy_logger.error(f"PANW Prisma AIRS: Error during final scanning: {str(e)}")
+                    # On scanning error, yield all chunks (fail open approach)
+                    verbose_proxy_logger.warning("PANW Prisma AIRS: Yielding all chunks due to scanning error")
+                    for chunk in all_chunks:
+                        yield chunk
+                    return
+            else:
+                # No content to scan, yield all chunks
+                for chunk in all_chunks:
+                    yield chunk
+            
+            return
+
+        # Incremental checking is enabled (interval > 0)
+        verbose_proxy_logger.info(f"PANW Prisma AIRS: Incremental checking enabled with interval {self.incremental_scan_chunk_size}")
+        
+        # Collect chunks and accumulated text for incremental checking
+        all_chunks: List["ModelResponseStream"] = []
+        accumulated_text = ""
+        last_yielded_position = 0  # Track how much content we've already yielded to user
+        pending_chunks: List["ModelResponseStream"] = []  # Chunks waiting for approval
+
+        try:
+            async for chunk in response:
+                all_chunks.append(chunk)
+                pending_chunks.append(chunk)
+                
+                # Extract text from current chunk
+                chunk_text = self._extract_text_from_chunk(chunk)
+                if chunk_text:
+                    accumulated_text += chunk_text
+                
+                # Check if we've accumulated enough content for incremental check
+                if len(accumulated_text) - last_yielded_position >= self.incremental_scan_chunk_size:
+                    
+                    verbose_proxy_logger.info(
+                        f"PANW Prisma AIRS: Performing incremental check at position {len(accumulated_text)} (pending approval for {len(accumulated_text) - last_yielded_position} characters)"
+                    )
+                    
+                    try:
+                        # Scan the accumulated text up to this point
+                        scan_result = await self._call_panw_api(
+                            content=accumulated_text, is_response=True, metadata=metadata
+                        )
+                        
+                        action = scan_result.get("action", "block")
+                        category = scan_result.get("category", "unknown")
+
+                        if action != "allow":
+                            # Content is blocked - stop streaming and return error
+                            error_detail = self._build_error_detail(scan_result, is_response=True)
+                            verbose_proxy_logger.warning(
+                                f"PANW Prisma AIRS: Incremental check blocked content at position {len(accumulated_text)} - {error_detail['error']['message']}"
+                            )
+                            
+                            # Create error chunk using the last valid chunk format
+                            if all_chunks:
+                                partial_assembled_response = stream_chunk_builder(chunks=all_chunks)
+                                if partial_assembled_response and not isinstance(partial_assembled_response, TextCompletionResponse):
+                                    error_chunk = self._create_error_chunk(partial_assembled_response, error_detail)
+                                    yield error_chunk
+                            return
+                        else:
+                            verbose_proxy_logger.debug(
+                                f"PANW Prisma AIRS: Incremental check passed at position {len(accumulated_text)} (Category: {category})"
+                            )
+                            
+                            # Content is safe - yield all pending chunks
+                            for pending_chunk in pending_chunks:
+                                yield pending_chunk
+                            
+                            # Update tracking variables
+                            last_yielded_position = len(accumulated_text)
+                            pending_chunks.clear()
+                
+                    except Exception as e:
+                        verbose_proxy_logger.error(f"PANW Prisma AIRS: Error during incremental scanning: {str(e)}")
+                        # On scanning error, yield pending chunks (fail open approach)
+                        verbose_proxy_logger.warning("PANW Prisma AIRS: Yielding pending chunks due to scanning error")
+                        for pending_chunk in pending_chunks:
+                            yield pending_chunk
+                        last_yielded_position = len(accumulated_text)
+                        pending_chunks.clear()
+                
+        except Exception as e:
+            # If there's an error collecting chunks, log and stop
+            verbose_proxy_logger.error(f"PANW Prisma AIRS: Error during streaming: {str(e)}")
+            return
+
+        # Handle any remaining pending chunks after the loop ends
+        if pending_chunks and accumulated_text:
+            remaining_chars = len(accumulated_text) - last_yielded_position
+            if remaining_chars > 0:
+                # Check if streaming check is disabled before performing final incremental check
+                if getattr(self, 'disable_streaming_check', False):
+                    verbose_proxy_logger.info("PANW Prisma AIRS: Streaming check disabled, yielding remaining pending chunks without final check")
+                    for pending_chunk in pending_chunks:
+                        yield pending_chunk
+                    return
+                
+                verbose_proxy_logger.info(
+                    f"PANW Prisma AIRS: Performing final incremental check on remaining {remaining_chars} characters"
+                )
+                
+                try:
+                    # Scan the complete accumulated text
+                    scan_result = await self._call_panw_api(
+                        content=accumulated_text, is_response=True, metadata=metadata
+                    )
+                    
+                    action = scan_result.get("action", "block")
+                    category = scan_result.get("category", "unknown")
+
+                    if action != "allow":
+                        # Content is blocked - return error instead of pending chunks
+                        error_detail = self._build_error_detail(scan_result, is_response=True)
+                        verbose_proxy_logger.warning(
+                            f"PANW Prisma AIRS: Final incremental check blocked remaining content - {error_detail['error']['message']}"
+                        )
+                        
+                        # Create error chunk
+                        if all_chunks:
+                            final_assembled_response = stream_chunk_builder(chunks=all_chunks)
+                            if final_assembled_response and not isinstance(final_assembled_response, TextCompletionResponse):
+                                error_chunk = self._create_error_chunk(final_assembled_response, error_detail)
+                                yield error_chunk
+                        return
+                    else:
+                        verbose_proxy_logger.info(
+                            f"PANW Prisma AIRS: Final incremental check passed (Category: {category})"
+                        )
+                        
+                        # Content is safe - yield remaining pending chunks
+                        for pending_chunk in pending_chunks:
+                            yield pending_chunk
+                        
+                except Exception as e:
+                    verbose_proxy_logger.error(f"PANW Prisma AIRS: Error during final incremental scanning: {str(e)}")
+                    # On scanning error, yield pending chunks (fail open approach)
+                    verbose_proxy_logger.warning("PANW Prisma AIRS: Yielding remaining chunks due to scanning error")
+                    for pending_chunk in pending_chunks:
+                        yield pending_chunk
+            else:
+                # No remaining content to check, yield any pending chunks
+                for pending_chunk in pending_chunks:
+                    yield pending_chunk
+
     @log_guardrail_information
     async def async_moderation_hook(
         self,
@@ -383,7 +673,7 @@ class PanwPrismaAirsHandler(CustomGuardrail):
         self._check_scan_result(scan_result, is_response=False)
 
         return data
-    
+
     @staticmethod
     def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
         from litellm.types.proxy.guardrails.guardrail_hooks.panw_prisma_airs import (

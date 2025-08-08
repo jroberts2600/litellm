@@ -14,6 +14,8 @@ LiteLLM supports PANW Prisma AIRS (AI Runtime Security) guardrails via the [Pris
 - ✅ **Comprehensive threat detection** for AI models and datasets
 - ✅ **Model-agnostic protection** across public and private models
 - ✅ **Synchronous scanning** with immediate response
+- ✅ **Streaming support** - Real-time scanning with configurable chunk sizes
+- ✅ **Incremental scanning** - Process streaming responses at configurable intervals
 - ✅ **Configurable security profiles**
 
 ## Quick Start
@@ -44,13 +46,17 @@ guardrails:
       mode: "pre_call"                    # Run before LLM call
       api_key: os.environ/AIRS_API_KEY    # Your PANW API key
       profile_name: os.environ/AIRS_API_PROFILE_NAME  # Security profile from Strata Cloud Manager
-      api_base: "https://service.api.aisecurity.paloaltonetworks.com/v1/scan/sync/request"  # Optional
+
+      # The following variables are optional
+      api_base: "https://service.api.aisecurity.paloaltonetworks.com/v1/scan/sync/request"  
+      incremental_scan_chunk_size: 50      # Scan every 50 chars (0 = scan only at end, default 0)
+      disable_streaming_check: False         # Set true to skip streaming scans, only run post_call_success_hook. default False.
 ```
 
 #### Supported values for `mode`
 
 - `pre_call` Run **before** LLM call, on **input**
-- `post_call` Run **after** LLM call, on **input & output**  
+- `post_call` Run **after** LLM call, on **output**  
 - `during_call` Run **during** LLM call, on **input**. Same as `pre_call` but runs in parallel with LLM call
 
 ### 3. Start LiteLLM Gateway
@@ -199,6 +205,8 @@ Expected successful response:
 | `profile_name` | Yes | Security profile name configured in Strata Cloud Manager | - |
 | `api_base` | No | Custom API endpoint | `https://service.api.aisecurity.paloaltonetworks.com/v1/scan/sync/request` |
 | `mode` | No | When to run the guardrail | `pre_call` |
+| `incremental_scan_chunk_size` | No | Run scan every XX chars. If set to 0, only scan at the end | 0 |
+| `disable_streaming_check` | No | Whether to skip streaming scans | False |
 
 ## Environment Variables
 
