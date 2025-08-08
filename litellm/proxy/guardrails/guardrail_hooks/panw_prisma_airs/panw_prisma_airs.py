@@ -335,7 +335,55 @@ class PanwPrismaAirsHandler(CustomGuardrail):
         self._check_scan_result(scan_result, is_response=True)
 
         return response
+    @log_guardrail_information
+    async def async_moderation_hook(
+        self,
+        data: Dict[str, Any],
+        user_api_key_dict: UserAPIKeyAuth,
+        call_type: Literal[
+            "completion",
+            "text_completion",
+            "embeddings",
+            "image_generation",
+            "moderation",
+            "audio_transcription",
+            "pass_through_endpoint",
+            "rerank",
+        ],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Moderation hook to scan user prompts for content moderation during call processing.
 
+        Raises HTTPException if content should be blocked.
+        """
+        verbose_proxy_logger.info("PANW Prisma AIRS: Running moderation prompt scan")
+
+        # Extract prompt text from messages
+        messages = data.get("messages", [])
+        prompt_text = self._extract_text_from_messages(messages)
+
+        if not prompt_text:
+            verbose_proxy_logger.warning(
+                "PANW Prisma AIRS: No user prompt found in request for moderation"
+            )
+            return data
+
+        # Prepare metadata
+        metadata = {
+            "user": data.get("user", "litellm_user"),
+            "model": data.get("model", "unknown"),
+        }
+
+        # Scan prompt with PANW Prisma AIRS
+        scan_result = await self._call_panw_api(
+            content=prompt_text, is_response=False, metadata=metadata
+        )
+
+        # Check scan result and raise exception if needed
+        self._check_scan_result(scan_result, is_response=False)
+
+        return data
+    
     @staticmethod
     def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
         from litellm.types.proxy.guardrails.guardrail_hooks.panw_prisma_airs import (
